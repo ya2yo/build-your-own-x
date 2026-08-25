@@ -8,6 +8,23 @@ This repository is a compilation of well-written, step-by-step guides for re-cre
 
 It's a great way to learn.
 
+## Rust development
+
+The repository pins Rust to the stable `1.95.0` toolchain in
+[`rust-toolchain.toml`](rust-toolchain.toml). Rust tutorial implementations can
+be added as independent binaries under `src/bin/`, for example
+`src/bin/my-server.rs`. Cargo discovers each file as a separate target, so you
+can check or run only the tutorial you are working on:
+
+```bash
+cargo check --bin my-server
+cargo run --bin my-server
+cargo build --release --bin my-server
+```
+
+Shared code can live in `src/lib.rs`. Keep dependencies in the root
+`Cargo.toml`; Cargo will resolve them for the selected binary.
+
 * [3D Renderer](#build-your-own-3d-renderer)
 * [AI Model](#build-your-own-ai-model)
 * [Augmented Reality](#build-your-own-augmented-reality)

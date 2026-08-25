@@ -1,0 +1,11 @@
+[package]
+name = "build-your-own-x"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep the repository extensible: each tutorial program can live in
+# `src/bin/<name>.rs` and be built independently with `cargo check --bin <name>`.
+
+[workspace]
+resolver = "2"

@@ -1,0 +1,5 @@
+[toolchain]
+# Pin an exact stable release so future stable updates cannot change this project.
+channel = "1.95.0"
+profile = "minimal"
+components = ["clippy", "rustfmt", "rust-src", "rust-analyzer"]
