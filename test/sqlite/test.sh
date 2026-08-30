@@ -22,7 +22,7 @@ assert_count() {
   local expected_count=$2
   local text=$3
   local actual_count
-  actual_count=$(grep -oF -- "$text" "$output_file" | wc -l)
+  actual_count=$(awk -v expected="$text" 'index($0, expected) { count++ } END { print count + 0 }' "$output_file")
   if [[ "$actual_count" -ne "$expected_count" ]]; then
     printf 'sqlite test failed: expected %d occurrences of %s, got %d\n' \
       "$expected_count" "$text" "$actual_count" >&2
@@ -33,9 +33,10 @@ assert_count() {
 
 run_case() {
   local name=$1
-  local input_file=$2
-  local output_file=$3
-  if ! "$DB" <"$input_file" >"$output_file"; then
+  local db_file=$2
+  local input_file=$3
+  local output_file=$4
+  if ! "$DB" "$db_file" <"$input_file" >"$output_file"; then
     printf 'sqlite test failed: case %s exited unsuccessfully\n' "$name" >&2
     cat "$output_file" >&2
     exit 1
@@ -45,7 +46,7 @@ run_case() {
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 
-# Parser, meta commands, and the normal insert/select execution path.
+# Empty select, successful INSERT/SELECT, parser errors, and .exit file close.
 cat >"$work_dir/basic.in" <<'EOF'
 select
 insert 1 alice alice@example.com
@@ -60,7 +61,7 @@ foo
 .tables
 .exit
 EOF
-run_case basic "$work_dir/basic.in" "$work_dir/basic.out"
+run_case basic "$work_dir/basic.db" "$work_dir/basic.in" "$work_dir/basic.out"
 assert_contains "$work_dir/basic.out" 'Executed.'
 assert_contains "$work_dir/basic.out" '(1, alice, alice@example.com)'
 assert_contains "$work_dir/basic.out" '(2, bob, bob@example.com)'
@@ -70,55 +71,89 @@ assert_contains "$work_dir/basic.out" 'String is too long.'
 assert_contains "$work_dir/basic.out" "Unrecognized keyword at start of 'update 1 x'."
 assert_contains "$work_dir/basic.out" "Unrecognized keyword at start of 'foo'."
 assert_contains "$work_dir/basic.out" "unrecognized command '.tables', try again!"
-# The empty select produced no row, and the later select produced exactly two.
 assert_count "$work_dir/basic.out" 1 '(1, alice, alice@example.com)'
 assert_count "$work_dir/basic.out" 1 '(2, bob, bob@example.com)'
+[[ -f "$work_dir/basic.db" ]] || { echo 'sqlite test failed: database was not created' >&2; exit 1; }
 
-# Exact field limits exercise serialization/deserialization across large fields.
+# Reopen the same file: rows must survive close/open and be selectable again.
+cat >"$work_dir/reopen.in" <<'EOF'
+select
+.exit
+EOF
+run_case reopen "$work_dir/basic.db" "$work_dir/reopen.in" "$work_dir/reopen.out"
+assert_count "$work_dir/reopen.out" 1 '(1, alice, alice@example.com)'
+assert_count "$work_dir/reopen.out" 1 '(2, bob, bob@example.com)'
+
+# Appending after reopen must preserve existing rows and write the new row.
+cat >"$work_dir/append.in" <<'EOF'
+insert 3 carol carol@example.com
+.exit
+EOF
+run_case append "$work_dir/basic.db" "$work_dir/append.in" "$work_dir/append.out"
+run_case append-reopen "$work_dir/basic.db" "$work_dir/reopen.in" "$work_dir/append-reopen.out"
+assert_count "$work_dir/append-reopen.out" 1 '(1, alice, alice@example.com)'
+assert_count "$work_dir/append-reopen.out" 1 '(2, bob, bob@example.com)'
+assert_count "$work_dir/append-reopen.out" 1 '(3, carol, carol@example.com)'
+
+# Exact serialized field limits, id zero, and the first page boundary.
 username_32=$(printf 'u%.0s' {1..32})
 email_255="$(printf 'e%.0s' {1..243})@example.com"
 cat >"$work_dir/boundary.in" <<EOF
 insert 0 $username_32 $email_255
-select
-insert 7 ${username_32}x $email_255
-insert 8 $username_32 ${email_255}x
-.exit
-EOF
-run_case boundary "$work_dir/boundary.in" "$work_dir/boundary.out"
-assert_contains "$work_dir/boundary.out" "(0, $username_32, $email_255)"
-assert_count "$work_dir/boundary.out" 2 'String is too long.'
-# id=0 is accepted by the current parser and must survive a round trip.
-assert_count "$work_dir/boundary.out" 1 '(0, '
-
-# A generated pressure run crosses page boundaries repeatedly and fills all
-# 100 table pages. 13 rows fit in one 4096-byte page (ROW_SIZE is 293).
-pressure_rows=1301
-: >"$work_dir/pressure.in"
-for ((id = 0; id < pressure_rows; id++)); do
-  printf 'insert %d user%d user%d@example.com\n' "$id" "$id" "$id" >>"$work_dir/pressure.in"
-done
-printf '.exit\n' >>"$work_dir/pressure.in"
-run_case pressure "$work_dir/pressure.in" "$work_dir/pressure.out"
-assert_count "$work_dir/pressure.out" 1300 'Executed.'
-assert_count "$work_dir/pressure.out" 1 'Error: Table full.'
-
-# Keep a focused page-boundary round trip assertion in addition to the full
-# table pressure run (rows 13/14 and 27/28 land on adjacent pages).
-cat >"$work_dir/pages.in" <<'EOF'
 insert 13 page13 page13@example.com
 insert 14 page14 page14@example.com
 insert 27 page27 page27@example.com
 insert 28 page28 page28@example.com
 select
+insert 7 ${username_32}x $email_255
+insert 8 $username_32 ${email_255}x
 .exit
 EOF
-run_case pages "$work_dir/pages.in" "$work_dir/pages.out"
+run_case boundary "$work_dir/boundary.db" "$work_dir/boundary.in" "$work_dir/boundary.out"
+assert_contains "$work_dir/boundary.out" "(0, $username_32, $email_255)"
 for row in \
   '(13, page13, page13@example.com)' \
   '(14, page14, page14@example.com)' \
   '(27, page27, page27@example.com)' \
   '(28, page28, page28@example.com)'; do
-  assert_contains "$work_dir/pages.out" "$row"
+  assert_contains "$work_dir/boundary.out" "$row"
 done
+assert_count "$work_dir/boundary.out" 2 'String is too long.'
+assert_count "$work_dir/boundary.out" 1 '(0, '
 
-printf 'sqlite: parser, meta commands, round trips, page boundaries, and %d-row pressure test passed\n' "$pressure_rows"
+# Pressure test: cross every page and attempt one insert beyond the 100-page limit.
+# ROW_SIZE is 293, so 13 rows/page and 1300 rows/table.
+pressure_rows=1301
+: >"$work_dir/pressure.in"
+for ((id = 0; id < pressure_rows; id++)); do
+  printf 'insert %d user%d user%d@example.com\n' "$id" "$id" "$id" >>"$work_dir/pressure.in"
+done
+printf 'select\n.exit\n' >>"$work_dir/pressure.in"
+pressure_start=$(date +%s%N)
+run_case pressure "$work_dir/pressure.db" "$work_dir/pressure.in" "$work_dir/pressure.out"
+pressure_end=$(date +%s%N)
+pressure_elapsed_ns=$((pressure_end - pressure_start))
+pressure_elapsed_ms=$((pressure_elapsed_ns / 1000000))
+# 1300 successful INSERTs plus the final SELECT each report Executed.
+assert_count "$work_dir/pressure.out" 1301 'Executed.'
+assert_count "$work_dir/pressure.out" 1 'Error: Table full.'
+assert_count "$work_dir/pressure.out" 1 '(0, user0, user0@example.com)'
+assert_count "$work_dir/pressure.out" 1 '(1299, user1299, user1299@example.com)'
+assert_count "$work_dir/pressure.out" 0 '(1300, user1300, user1300@example.com)'
+
+# Reopen the pressure database and verify page-backed persistence at both ends.
+run_case pressure-reopen "$work_dir/pressure.db" "$work_dir/reopen.in" "$work_dir/pressure-reopen.out"
+assert_count "$work_dir/pressure-reopen.out" 1 '(0, user0, user0@example.com)'
+assert_count "$work_dir/pressure-reopen.out" 1 '(1299, user1299, user1299@example.com)'
+assert_count "$work_dir/pressure-reopen.out" 0 '(1300, user1300, user1300@example.com)'
+
+# Every full page is flushed as PAGE_SIZE bytes; the last page is full too.
+expected_size=$((100 * 4096))
+actual_size=$(stat -c '%s' "$work_dir/pressure.db")
+[[ "$actual_size" -eq "$expected_size" ]] || {
+  printf 'sqlite test failed: expected database size %d, got %d\n' "$expected_size" "$actual_size" >&2
+  exit 1
+}
+printf 'sqlite pressure: %d attempted inserts, %d persisted rows, elapsed %d ms\n' \
+  "$pressure_rows" 1300 "$pressure_elapsed_ms"
+printf 'sqlite: insert/select, boundaries, persistence, page I/O, and pressure tests passed\n'

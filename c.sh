@@ -14,7 +14,8 @@ parsing_program_args=false
 usage() {
   cat <<'EOF'
 Usage:
-  ./c [run|build] --bin <name> [-- program arguments]
+  ./c [run|build] --bin <name> [program arguments]
+  ./c [run|build] --bin <name> -- [program arguments]
   ./c --list
   ./c --test --bin <name>
 
@@ -72,9 +73,17 @@ while (($#)); do
       exit 0
       ;;
     *)
-      echo "error: unknown argument: $1" >&2
-      usage >&2
-      exit 2
+      # Once a binary is selected, accept positional arguments as a
+      # convenient shorthand for the program's arguments.  This keeps both
+      # forms valid: `--bin sqlite -- tmp.db` and `--bin sqlite tmp.db`.
+      if [[ -n "$bin_name" ]]; then
+        program_args+=("$1")
+        shift
+      else
+        echo "error: unknown argument: $1" >&2
+        usage >&2
+        exit 2
+      fi
       ;;
   esac
 done
