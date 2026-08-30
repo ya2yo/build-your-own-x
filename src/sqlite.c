@@ -71,6 +71,15 @@ typedef struct {
     Pager *pager;
 } Table;
 
+/* ================================ Cursor ================================= */
+
+/** Repesents a loaction in the table */
+typedef struct {
+    Table *table;
+    uint32_t row_num;
+    bool end_of_table;// Indicates a position one past the last element
+} Cursor;
+
 /* Serialized row layout.  These offsets deliberately avoid struct padding. */
 const uint32_t ID_SIZE = size_of_attribute(Row, id);
 const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
@@ -86,6 +95,7 @@ const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 const uint32_t PAGER_SIZE = sizeof(Pager);
 const uint32_t TABLE_SIZE = sizeof(Table);
+const uint32_t CURSOR_SIZE = sizeof(Cursor);
 
 /** Prints a row in the format used by the interactive shell. */
 void print_row(Row* row) {
@@ -198,15 +208,6 @@ Table* db_open(const char* filename) {
     return table;
 }
 
-/** Returns the address of the serialized slot for the given row number. */
-void* row_slot(Table* table, uint32_t row_num) {
-    uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void *page = get_page(table->pager, page_num);
-    uint32_t row_offset = row_num % ROWS_PER_PAGE;
-    uint32_t byte_offset = row_offset * ROW_SIZE;
-    return (void*)((char*)page + byte_offset);
-}
-
 /** Flushes cached pages and releases all resources owned by the table. */
 void db_close(Table* table) {
     Pager* pager = table->pager;
@@ -250,6 +251,45 @@ void db_close(Table* table) {
 
     free(pager);
     free(table);
+}
+
+/* =============================== Cursor ================================== */
+
+/** create a Cursor object in the start of table */
+Cursor* table_start(Table *table) {
+    Cursor* cursor = malloc(CURSOR_SIZE);
+    cursor->table = table;
+    cursor->row_num = 0;
+    cursor->end_of_table = (table->row_nums == 0);
+    return cursor;
+}
+
+/** create a Cursor object in the end of table */
+Cursor* table_end(Table* table) {
+    Cursor* cursor = malloc(CURSOR_SIZE);
+    cursor->table = table;
+    cursor->row_num = table->row_nums;
+    cursor->end_of_table = true;
+    return cursor;
+}
+
+/** return a pointer to the position descibed by the cursor */
+void* cursor_value(Cursor* cursor) {
+    Table* table = cursor->table;
+    uint32_t row_num = cursor->row_num;
+    uint32_t page_num = row_num / ROWS_PER_PAGE;
+    uint32_t row_offset = row_num % ROWS_PER_PAGE;
+    uint32_t byte_offset = row_offset * ROW_SIZE;
+    void *page = get_page(table->pager, page_num);
+    return page + byte_offset;
+}
+
+/** advance the cursor in the table */
+void cursor_advance(Cursor* cursor) {
+    cursor->row_num+=1;
+    if(cursor->row_num>=TABLE_MAX_ROWS) {
+        cursor->end_of_table = true;
+    }
 }
 
 /* ============================= Input buffer ============================== */
@@ -337,18 +377,23 @@ EXECUTE_RESULT execute_insert(Statement* statement, Table* table) {
         return EXECUTE_TABLE_FULL;
     }
     Row *row_to_insert = &(statement->row_to_insert);
-    serialize_row(row_to_insert, row_slot(table, table->row_nums));
+    Cursor *cursor = table_end(table);
+    serialize_row(row_to_insert, cursor_value(cursor));
     table->row_nums += 1;
+    free(cursor);
     return EXECUTE_SUCCESS;
 }
 /** Executes a SELECT statement by printing every stored row. */
 EXECUTE_RESULT execute_select(__attribute__ ((unused)) Statement *statement,
                               Table *table) {
     Row row;
-    for (uint32_t i = 0; i < table->row_nums; ++i) {
-        deserial_row(row_slot(table, i), &row);
+    Cursor *cursor = table_start(table);
+    while(!cursor->end_of_table) {
+        deserial_row(cursor_value(cursor), &row);
         print_row(&row);
+        cursor_advance(cursor);
     }
+    free(cursor);
     return EXECUTE_SUCCESS;
 }
 /** Dispatches a prepared statement to its execution function. */
