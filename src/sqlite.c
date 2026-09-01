@@ -130,17 +130,108 @@ const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
 const uint32_t LEAF_NODE_MAX_CELLS =
     LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
-/* ================== Function Declaration ========================= */
+/* ================== Function Declarations ========================= */
 
-/* ================== Print Function =============================*/
+/* Row and display */
 void print_row(Row *row);
-void print_constants();
+void print_constants(void);
 void print_leaf_node(void *node);
-
 void serialize_row(Row *source, void *destination);
 void deserial_row(void *source, Row *destination);
 
+/* Node */
+uint32_t *leaf_node_num_cells(void *node);
+void *leaf_node_cell(void *node, uint32_t cell_num);
+uint32_t *leaf_node_key(void *node, uint32_t cell_num);
+void *leaf_node_value(void *node, uint32_t cell_num);
+void initialize_leaf_node(void *node);
+void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value);
+
+/* Pager */
+Pager *pager_open(const char *filename);
 void *get_page(Pager *pager, uint32_t page_num);
+void page_flush(Pager *pager, uint32_t page_num);
+
+/* Table */
+Table *db_open(const char *filename);
+void db_close(Table *table);
+
+/* Cursor */
+Cursor *table_start(Table *table);
+Cursor *table_end(Table *table);
+void *cursor_value(Cursor *cursor);
+void cursor_advance(Cursor *cursor);
+
+/* Input buffer */
+InputBuffer *new_input_buffer(void);
+void read_input(InputBuffer *input_buffer);
+void close_input_buffer(InputBuffer *input_buffer);
+
+/* Meta commands, parsing, and execution */
+META_COMMAND_RESULT do_meta_command(InputBuffer *input_buffer, Table *table);
+PREPARE_RESULT prepare_insert(InputBuffer *input_buffer, Statement *statement);
+PREPARE_RESULT prepare_statement(InputBuffer *input_buffer, Statement *statement);
+EXECUTE_RESULT execute_insert(Statement *statement, Table *table);
+EXECUTE_RESULT execute_select(Statement *statement, Table *table);
+EXECUTE_RESULT execute_statement(Statement *statement, Table *table);
+
+/* ================================ Main ================================== */
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        printf("Must supply a database filename.\n");
+        exit(EXIT_FAILURE);
+    }
+    char *filename = argv[1];
+    Table *table = db_open(filename);
+
+    InputBuffer *input_buffer = new_input_buffer();
+    while (true) {
+        /* Display the prompt and read one command from the user. */
+        printf("db > ");
+        read_input(input_buffer);
+        if(input_buffer->buffer[0] == '.') {
+            /* Dot-prefixed commands are handled separately from statements. */
+            switch(do_meta_command(input_buffer, table)) {
+                case META_COMMAND_SUCCESS:
+                    continue;
+                case META_COMMAND_UNRECOGNIZIED_COMMAND:
+                    printf("unrecognized command '%s', try again!\n",
+                           input_buffer->buffer);
+                    continue;
+            }
+        }
+        Statement statement;
+        /* Parse the command, then execute it if parsing succeeds. */
+        switch(prepare_statement(input_buffer, &statement)) {
+            case PREPARE_SUCCESS:
+                break;
+            case PREPARE_NEGATIVE_ID:
+                printf("ID must be positive.\n");
+                continue;
+            case PREPARE_STRING_TOO_LONG:
+                printf("String is too long.\n");
+                continue;
+            case PREPARE_SYNTAX_ERROR:
+                printf("Syntax error. Could not parse statement.\n");
+                continue;
+            case PREPARE_UNRECOGNIZIED_STATEMENT:
+                printf("Unrecognized keyword at start of '%s'.\n",
+                       input_buffer->buffer);
+                continue;
+        }
+        switch(execute_statement(&statement, table)) {
+            case EXECUTE_SUCCESS:
+                printf("Executed.\n");
+                break;
+            case EXECUTE_TABLE_FULL:
+                printf("Error: Table full.\n");
+                break;
+        }
+    }
+}
+
+/* ================================ Print / Serialization ================= */
 
 /** Prints a row in the format used by the interactive shell. */
 void print_row(Row* row) {
@@ -166,7 +257,7 @@ void deserial_row(void* source, Row* destination) {
     memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
-/* ================================ Node  ================================= */
+/* ================================ Node ================================== */
 
 /** Return the address of the num_cells in the node page header */
 uint32_t* leaf_node_num_cells(void* node) {
@@ -492,6 +583,7 @@ PREPARE_RESULT prepare_insert(InputBuffer* input_buffer, Statement* statement) {
 
     return PREPARE_SUCCESS;
 }
+
 /** Converts the input buffer into a prepared statement. */
 PREPARE_RESULT prepare_statement(InputBuffer* input_buffer, Statement* statement) {
     if(strncmp(input_buffer->buffer, "insert", 6)==0) {
@@ -503,6 +595,7 @@ PREPARE_RESULT prepare_statement(InputBuffer* input_buffer, Statement* statement
         return PREPARE_UNRECOGNIZIED_STATEMENT;
     }
 }
+
 /** Executes an INSERT statement and stores the new row in its slot. */
 EXECUTE_RESULT execute_insert(Statement* statement, Table* table) {
     void *node = get_page(table->pager, table->root_num_page);
@@ -517,6 +610,7 @@ EXECUTE_RESULT execute_insert(Statement* statement, Table* table) {
     free(cursor);
     return EXECUTE_SUCCESS;
 }
+
 /** Executes a SELECT statement by printing every stored row. */
 EXECUTE_RESULT execute_select(__attribute__ ((unused)) Statement *statement,
                               Table *table) {
@@ -530,6 +624,7 @@ EXECUTE_RESULT execute_select(__attribute__ ((unused)) Statement *statement,
     free(cursor);
     return EXECUTE_SUCCESS;
 }
+
 /** Dispatches a prepared statement to its execution function. */
 EXECUTE_RESULT execute_statement(Statement* statement, Table* table) {
     switch (statement->type) {
@@ -540,58 +635,4 @@ EXECUTE_RESULT execute_statement(Statement* statement, Table* table) {
         default:
             return EXECUTE_SUCCESS;
         }
-}
-
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Must supply a database filename.\n");
-        exit(EXIT_FAILURE);
-    }
-    char *filename = argv[1];
-    Table *table = db_open(filename);
-
-    InputBuffer *input_buffer = new_input_buffer();
-    while (true) {
-        /* Display the prompt and read one command from the user. */
-        printf("db > ");
-        read_input(input_buffer);
-        if(input_buffer->buffer[0] == '.') {
-            /* Dot-prefixed commands are handled separately from statements. */
-            switch(do_meta_command(input_buffer, table)) {
-                case META_COMMAND_SUCCESS:
-                    continue;
-                case META_COMMAND_UNRECOGNIZIED_COMMAND:
-                    printf("unrecognized command '%s', try again!\n",
-                           input_buffer->buffer);
-                    continue;
-            }
-        }
-        Statement statement;
-        /* Parse the command, then execute it if parsing succeeds. */
-        switch(prepare_statement(input_buffer, &statement)) {
-            case PREPARE_SUCCESS:
-                break;
-            case PREPARE_NEGATIVE_ID:
-                printf("ID must be positive.\n");
-                continue;
-            case PREPARE_STRING_TOO_LONG:
-                printf("String is too long.\n");
-                continue;
-            case PREPARE_SYNTAX_ERROR:
-                printf("Syntax error. Could not parse statement.\n");
-                continue;
-            case PREPARE_UNRECOGNIZIED_STATEMENT:
-                printf("Unrecognized keyword at start of '%s'.\n",
-                       input_buffer->buffer);
-                continue;
-        }
-        switch(execute_statement(&statement, table)) {
-            case EXECUTE_SUCCESS:
-                printf("Executed.\n");
-                break;
-            case EXECUTE_TABLE_FULL:
-                printf("Error: Table full.\n");
-                break;
-        }
-    }
 }
