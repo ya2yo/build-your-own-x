@@ -1,3 +1,11 @@
+/**
+ * # The leaf_node layout
+ * | byte 0     | byte 1        | bytes 2-5         | bytes 6-9 |
+ * | node_type  | is_root       | parent_pointer    | num_cells |
+ * |bytes 6-9   | bytes 10-13   | bytes 14-306      |
+ * | num_cells  | key 0         | value 0           |
+ */
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -27,7 +35,11 @@ typedef struct {
 } InputBuffer;
 
 /** Results that can be returned while executing a prepared statement. */
-typedef enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL } EXECUTE_RESULT;
+typedef enum {
+    EXECUTE_SUCCESS,
+    EXECUTE_DUPLICATE_KEY,
+    EXECUTE_TABLE_FULL
+} EXECUTE_RESULT;
 
 /** Results returned while handling a dot-prefixed meta-command. */
 typedef enum {
@@ -139,6 +151,10 @@ void print_leaf_node(void *node);
 void serialize_row(Row *source, void *destination);
 void deserial_row(void *source, Row *destination);
 
+/* Node type*/
+NodeType get_node_type(void *node);
+void set_node_type(void *node, NodeType type);
+
 /* Node */
 uint32_t *leaf_node_num_cells(void *node);
 void *leaf_node_cell(void *node, uint32_t cell_num);
@@ -146,6 +162,7 @@ uint32_t *leaf_node_key(void *node, uint32_t cell_num);
 void *leaf_node_value(void *node, uint32_t cell_num);
 void initialize_leaf_node(void *node);
 void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value);
+Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key);
 
 /* Pager */
 Pager *pager_open(const char *filename);
@@ -158,7 +175,7 @@ void db_close(Table *table);
 
 /* Cursor */
 Cursor *table_start(Table *table);
-Cursor *table_end(Table *table);
+Cursor *table_find(Table *table, uint32_t key);
 void *cursor_value(Cursor *cursor);
 void cursor_advance(Cursor *cursor);
 
@@ -257,6 +274,19 @@ void deserial_row(void* source, Row* destination) {
     memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
+/* =============================== Node Type ============================== */
+
+/* Return the tyoe of given node */
+NodeType get_node_type(void *node) {
+    uint8_t value = *((uint8_t *)(node + NODE_TYPE_OFFSET));
+    return (NodeType)value;
+}
+
+void set_node_type(void *node, NodeType type) {
+    uint8_t value = type;
+    *((uint8_t *)(node + NODE_TYPE_OFFSET)) = value;
+}
+
 /* ================================ Node ================================== */
 
 /** Return the address of the num_cells in the node page header */
@@ -303,6 +333,36 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
     *(leaf_node_num_cells(node)) += 1;
     *(leaf_node_key(node, cursor->cell_num)) = key;
     serialize_row(value, leaf_node_value(node, cursor->cell_num));
+}
+
+/* Return a Cursor according to the given page_num and key */
+Cursor *leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
+    void *node = get_page(table->pager, page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    Cursor *cursor = malloc(CURSOR_SIZE);
+    cursor->page_num = page_num;
+    cursor->table = table;
+
+    // Binary search
+    uint32_t left = 0, right = num_cells;
+    while(left < right) {
+        uint32_t mid = left + (right - left) / 2;
+        uint32_t mid_key = *leaf_node_key(node, mid);
+        if(mid_key>key) {
+            right = mid;
+        }else if(mid_key<key) {
+            left = mid + 1;
+        } else {
+            cursor->cell_num = mid;
+            return cursor;
+        }
+    }
+    cursor->cell_num = left;
+    if(left ==  num_cells) {
+        cursor->end_of_table = true;
+    }
+    return cursor;
 }
 
 void print_constants() {
@@ -474,18 +534,16 @@ Cursor* table_start(Table *table) {
     return cursor;
 }
 
-/** create a Cursor object in the end of table */
-Cursor* table_end(Table* table) {
-    Cursor* cursor = malloc(CURSOR_SIZE);
-    cursor->table = table;
-    cursor->page_num = table->root_num_page;
-
-    void *root_node = get_page(table->pager, table->root_num_page);
-    uint32_t num_cells = *leaf_node_num_cells(root_node);
-    cursor->cell_num = num_cells;
-    cursor->end_of_table = true;
-
-    return cursor;
+/* Return a Cursor at the given key or the last */
+Cursor *table_find(Table*table, uint32_t key) {
+    uint32_t root_page_num = table->root_num_page;
+    void *root_node = get_page(table->pager, root_page_num);
+    if(get_node_type(root_node)==NODE_LEAF) {
+        return leaf_node_find(table, root_page_num, key);
+    } else {
+        printf("Need to implement searching an internalnode");
+        exit(EXIT_FAILURE);
+    }
 }
 
 /** return a pointer to the position descibed by the cursor */
@@ -599,12 +657,22 @@ PREPARE_RESULT prepare_statement(InputBuffer* input_buffer, Statement* statement
 /** Executes an INSERT statement and stores the new row in its slot. */
 EXECUTE_RESULT execute_insert(Statement* statement, Table* table) {
     void *node = get_page(table->pager, table->root_num_page);
-    if(*(leaf_node_num_cells(node)) >= LEAF_NODE_MAX_CELLS) {
+    uint32_t num_cells = (*leaf_node_num_cells(node));
+    if (num_cells >= LEAF_NODE_MAX_CELLS) {
         return EXECUTE_TABLE_FULL;
     }
 
     Row *row_to_insert = &(statement->row_to_insert);
-    Cursor *cursor = table_end(table);
+    uint32_t key_to_insert = row_to_insert->id;
+    Cursor *cursor = table_find(table,key_to_insert);
+
+    if(cursor->cell_num < num_cells) {
+        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+        if(key_at_index == key_to_insert) {
+            return EXECUTE_DUPLICATE_KEY;
+        }
+    }
+
     leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
     // table->row_nums += 1;
     free(cursor);
