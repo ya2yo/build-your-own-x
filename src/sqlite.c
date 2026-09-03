@@ -476,89 +476,82 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
 
 /* Split a full leaf and insert the new key into the appropriate half. */
 void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value) {
-    Pager *pager = cursor->table->pager;
-    if (pager->num_pages >= TABLE_MAX_PAGES) {
-        /* execute_insert checks this before reaching here; keep this guard for
-         * callers of the node API as well. */
-        fprintf(stderr, "Error: Table full.\n");
-        exit(EXIT_FAILURE);
-    }
+    Table *table = cursor->table;
+    Pager *pager = table->pager;
 
     void *old_node = get_page(pager, cursor->page_num);
     uint32_t old_max = get_node_max_key(pager, old_node);
+
     uint32_t new_page_num = get_unused_page_num(pager);
     void *new_node = get_page(pager, new_page_num);
+    initialize_leaf_node(new_node);
 
-    /* Sequential appends are common for integer primary keys.  Keep the
-     * existing rightmost leaf full and place the appended row in a new leaf;
-     * this preserves page capacity while arbitrary inserts still use the
-     * balanced split below. */
+    uint32_t parent_page_num = *node_parent(old_node);
+
+    /*
+     * Fast path for appending to the rightmost leaf. The old leaf is already
+     * full, so keep all of its cells and store the new row in a fresh leaf.
+     */
     if (cursor->cell_num == LEAF_NODE_MAX_CELLS &&
         *leaf_node_next_leaf(old_node) == 0 && key > old_max) {
-        initialize_leaf_node(new_node);
-        *node_parent(new_node) = *node_parent(old_node);
-        *leaf_node_next_leaf(old_node) = new_page_num;
+        *node_parent(new_node) = parent_page_num;
         *leaf_node_num_cells(new_node) = 1;
         *leaf_node_key(new_node, 0) = key;
         serialize_row(value, leaf_node_value(new_node, 0));
+        *leaf_node_next_leaf(old_node) = new_page_num;
 
         if (is_node_root(old_node)) {
-            create_new_root(cursor->table, new_page_num);
+            create_new_root(table, new_page_num);
         } else {
-            internal_node_insert(cursor->table, *node_parent(old_node),
-                                 new_page_num);
+            internal_node_insert(table, parent_page_num, new_page_num);
         }
         return;
     }
 
-    initialize_leaf_node(new_node);
-    *node_parent(new_node) = *node_parent(old_node);
-    *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
+    uint32_t old_next_page_num = *leaf_node_next_leaf(old_node);
+    *leaf_node_next_leaf(new_node) = old_next_page_num;
     *leaf_node_next_leaf(old_node) = new_page_num;
 
+    *node_parent(new_node) = parent_page_num;
+
     const uint32_t total_cells = LEAF_NODE_MAX_CELLS + 1;
-    for (int32_t i = (int32_t)total_cells - 1; i >= 0; --i) {
-        void *destination_node;
-        uint32_t index_within_node;
-        if ((uint32_t)i < LEAF_NODE_LEFT_SPLIT_COUNT) {
-            destination_node = old_node;
-            index_within_node = (uint32_t)i;
+
+    for (int32_t i = total_cells - 1; i >= 0;--i) {
+        void *dest_node;
+        uint32_t dest_index;
+
+        if((uint32_t)i<LEAF_NODE_LEFT_SPLIT_COUNT) {
+            dest_node = old_node;
+            dest_index = i;
         } else {
-            destination_node = new_node;
-            index_within_node = (uint32_t)i - LEAF_NODE_LEFT_SPLIT_COUNT;
+            dest_node = new_node;
+            dest_index = i - LEAF_NODE_LEFT_SPLIT_COUNT;
         }
 
-        void *destination = leaf_node_cell(destination_node, index_within_node);
-        if ((uint32_t)i == cursor->cell_num) {
-            *leaf_node_key(destination_node, index_within_node) = key;
-            serialize_row(value,
-                          leaf_node_value(destination_node, index_within_node));
+        void *dest = leaf_node_cell(dest_node, dest_index);
+        if((uint32_t)i==cursor->cell_num) {
+            *leaf_node_key(dest_node, dest_index) = key;
+            serialize_row(value, leaf_node_value(dest_node, dest_index));
         } else {
-            uint32_t source_index = (uint32_t)i > cursor->cell_num
-                                        ? (uint32_t)i - 1
-                                        : (uint32_t)i;
-            memcpy(destination, leaf_node_cell(old_node, source_index),
+            uint32_t source_index = (uint32_t)i > cursor->cell_num ? i - 1 : i;
+            memcpy(dest, leaf_node_cell(old_node, source_index),
                    LEAF_NODE_CELL_SIZE);
         }
     }
-
     *leaf_node_num_cells(old_node) = LEAF_NODE_LEFT_SPLIT_COUNT;
     *leaf_node_num_cells(new_node) = LEAF_NODE_RIGHT_SPLIT_COUNT;
 
     if (is_node_root(old_node)) {
-        create_new_root(cursor->table, new_page_num);
-        return;
+        create_new_root(table, new_page_num);
+    } else {
+        void *parent = get_page(pager, parent_page_num);
+        uint32_t old_child_index = internal_node_find_child(parent, old_max);
+        if(old_child_index<*internal_node_num_keys(parent) && *internal_node_child(parent, old_child_index)==cursor->page_num) {
+            update_internal_node_key(parent, old_max,
+                                     get_node_max_key(pager, old_node));
+        }
+        internal_node_insert(table, parent_page_num, new_page_num);
     }
-
-    uint32_t parent_page_num = *node_parent(old_node);
-    void *parent = get_page(pager, parent_page_num);
-    uint32_t old_child_index = internal_node_find_child(parent, old_max);
-    if (old_child_index < *internal_node_num_keys(parent) &&
-        *internal_node_child(parent, old_child_index) == cursor->page_num) {
-        update_internal_node_key(parent, old_max,
-                                 get_node_max_key(pager, old_node));
-    }
-    internal_node_insert(cursor->table, parent_page_num, new_page_num);
 }
 
 /* Return the child slot whose key range contains key. */
